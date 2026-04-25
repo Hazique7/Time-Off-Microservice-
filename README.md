@@ -1,5 +1,9 @@
 **Repository Link:** [https://github.com/Hazique7/Time-Off-Microservice-.git]
 
+## 📄 Documentation & Engineering Spec
+For a deep dive into the architecture, challenges, and alternatives considered during development, please read the:
+👉 **[Technical Requirement Document (TRD)](./TRD.md)** 👈
+
 # ExampleHR Time-Off Microservice
 
 A robust, highly defensive NestJS microservice designed to manage employee time-off requests, 
