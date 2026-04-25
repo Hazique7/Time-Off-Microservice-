@@ -83,4 +83,7 @@ Simulates a massive payload from the HCM. Overwrites local balances and automati
   ]
 }
 
+## 🧪 Proof of Coverage
+Unit tests were written using Jest to ensure the custom integer-math utility, state machine guards, and core service logic are protected from future regressions.
 
+![Coverage Report](./coverage-proof.png)
