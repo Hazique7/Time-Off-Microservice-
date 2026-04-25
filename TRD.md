@@ -1,6 +1,6 @@
 # 📄 Technical Requirements Document (TRD)
 ### Time-Off Microservice — ExampleHR Platform
-> **Version:** 1.1 &nbsp;|&nbsp; **Status:** Final &nbsp;|&nbsp; **Date:** April 2025
+> **Version:** 1.0 &nbsp;|&nbsp; **Status:** Final &nbsp;|&nbsp; **Date:** April 2026
 
 ---
 
@@ -31,7 +31,7 @@ The HCM is the authoritative source of truth for employment data. This service a
 - Provide REST endpoints for creating, reading, updating, and cancelling time-off requests
 - Maintain a local cache of leave balances **per employee per location**
 - Sync balances bidirectionally with the HCM via real-time API calls and batch imports
-- Handle HCM failures gracefully with retry logic, conflict resolution, and escalation workflows
+- Handle HCM failures gracefully with retry logic and conflict resolution
 - Enforce defensive balance validation even when HCM error responses are unreliable
 
 ### Non-Goals
@@ -47,7 +47,6 @@ The HCM is the authoritative source of truth for employment data. This service a
 |---|---|---|
 | **Employee** | Submit requests and see accurate real-time balances | Stale balance; request rejected after submission |
 | **Manager** | Review requests knowing data is valid | Approving a request that exceeds balance |
-| **HR Admin** | Manage balance overrides, batch syncs, and audit history | Data drift between ExampleHR and HCM going undetected |
 | **System (HCM)** | Receive deductions and push balance updates | ExampleHR filing requests against invalid balances |
 
 ---
@@ -66,7 +65,7 @@ The microservice is a **NestJS** application backed by **SQLite via TypeORM**. I
 │                                                              │
 │  ┌─────────────────┐  ┌──────────────────┐  ┌────────────┐  │
 │  │  BalanceModule  │  │ TimeOffRequest   │  │ HcmSync    │  │
-│  │  (cache + TTL)  │  │ Module           │  │ Module     │  │
+│  │  (cache)        │  │ Module           │  │ Module     │  │
 │  └────────┬────────┘  └────────┬─────────┘  └─────┬──────┘  │
 │           │                   │                   │          │
 │  ┌────────▼───────────────────▼───────────────────▼──────┐  │
@@ -86,7 +85,7 @@ The microservice is a **NestJS** application backed by **SQLite via TypeORM**. I
 |---|---|
 | `BalanceModule` | CRUD on local leave balance cache; exposes balance query endpoints |
 | `TimeOffRequestModule` | Manages request lifecycle: PENDING → APPROVED / REJECTED / CANCELLED |
-| `HcmSyncModule` | Handles real-time HCM calls, batch import, retry, and reconciliation |
+| `HcmSyncModule` | Handles HCM calls, batch import, retry, and reconciliation |
 | `MockHcmModule` | Standalone mock HTTP server simulating HCM for testing |
 
 ---
@@ -109,7 +108,7 @@ The microservice is a **NestJS** application backed by **SQLite via TypeORM**. I
 | `employeeId` | UUID (FK) | References `Employee` |
 | `locationId` | VARCHAR | Balance is per employee per location |
 | `balance` | DECIMAL(10,2) | Current available days |
-| `lastSyncedAt` | TIMESTAMP | `null` = unresolvably stale |
+| `lastSyncedAt` | TIMESTAMP | Updated on every successful batch sync |
 
 ### `TimeOffRequest`
 | Field | Type | Notes |
@@ -118,29 +117,10 @@ The microservice is a **NestJS** application backed by **SQLite via TypeORM**. I
 | `employeeId` | UUID (FK) | References `Employee` |
 | `locationId` | VARCHAR | Derived from employee record |
 | `days` | DECIMAL(10,2) | Must be a positive multiple of `0.5`. DTO rejects any other value with HTTP 422. Half-day increments are universal — no location-specific rounding. |
-| `status` | ENUM | HCM status: `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. **Source of truth for balance state.** |
-| `manager_status` | ENUM | ExampleHR-only: `PENDING_REVIEW`, `MANAGER_APPROVED`, `MANAGER_REJECTED`. Independent from `status`. Never affects balance. |
+| `status` | ENUM | `PENDING`, `APPROVED`, `REJECTED`, `CANCELLED`. Source of truth for balance state. |
 | `hcmRef` | VARCHAR | Reference ID returned by HCM on approval |
 | `createdAt` | TIMESTAMP | |
 | `updatedAt` | TIMESTAMP | |
-
-### `SyncLog`
-| Field | Type | Notes |
-|---|---|---|
-| `id` | UUID (PK) | |
-| `callType` | ENUM | `CREATION`, `CANCELLATION`, `BALANCE_SYNC`, `BATCH_SYNC` |
-| `entityId` | UUID | ID of the affected `TimeOffRequest` or `LeaveBalance` |
-| `status` | ENUM | `FAILED`, `ESCALATED`, `RESOLVED` |
-| `errorMessage` | TEXT | Raw HCM error or timeout message |
-| `attempts` | INTEGER | Attempts made before logging |
-| `createdAt` | TIMESTAMP | |
-| `resolvedAt` | TIMESTAMP | `null` until manually resolved |
-
-### `BatchSyncLock`
-| Field | Type | Notes |
-|---|---|---|
-| `employeeId` | UUID (PK) | Lock key — one per employee |
-| `acquiredAt` | TIMESTAMP | Set at start of batch transaction; removed on commit or rollback |
 
 ---
 
@@ -160,23 +140,14 @@ The microservice is a **NestJS** application backed by **SQLite via TypeORM**. I
 | `POST` | `/time-off` | Create a new request (validates balance, deducts tentatively, calls HCM) |
 | `GET` | `/time-off/:id` | Fetch a specific request by ID |
 | `GET` | `/time-off?employeeId=&status=` | List requests filtered by employee and/or status |
-| `PATCH` | `/time-off/:id/approve` | Manager marks request as reviewed — **no HCM call, no balance change** |
-| `PATCH` | `/time-off/:id/reject` | Manager rejects in ExampleHR — **does not undo HCM approval, does not restore balance** |
 | `PATCH` | `/time-off/:id/cancel` | Employee cancels — triggers HCM cancellation flow and balance refund |
-
-### Admin Endpoints
-| Method | Endpoint | Description |
-|---|---|---|
-| `PATCH` | `/admin/sync-log/:id/resolve` | HR Admin resolves an escalated SyncLog entry (`RETRY` / `OVERRIDE` / `DISCARD`) |
-
-> **Role enforcement:** Only users with the `HR_ADMIN` role may call `/admin/*` endpoints. Manager-role users receive `HTTP 403`.
 
 ---
 
 ## 6. Request Lifecycle & State Machine
 
 ### ⚠️ Resolved Design Decision — HCM Submission Timing
-> The HCM is called **immediately upon employee submission**, not upon manager approval. Manager approval is an ExampleHR-only workflow step and triggers **zero** HCM calls. Any implementation that delays the HCM call until manager approval is **incorrect**.
+> The HCM is called **immediately upon employee submission**. Any implementation that delays the HCM call until manager approval is **incorrect**.
 
 ---
 
@@ -209,24 +180,9 @@ Step 5a ── HCM SUCCESS → new transaction: set status = APPROVED, store hcm
 Step 5b ── HCM REJECTION → new transaction: refund balance, set status = REJECTED
            (only fires on genuine HCM HTTP failure — never on DB errors)
 
-Step 5c ── HCM TIMEOUT / MAX RETRIES EXHAUSTED → leave status = PENDING,
-           balance stays deducted, log to SyncLog, auto-reject after 3 failures
-           (see Retry Logic in §7.4)
+Step 5c ── HCM TIMEOUT / MAX RETRIES EXHAUSTED → new transaction: refund balance,
+           set status = REJECTED, return HTTP 503 to caller
 ```
-
----
-
-### Manager Actions
-
-| Action | Effect on `status` | Effect on `manager_status` | HCM Call | Balance Change |
-|---|---|---|---|---|
-| `PATCH /approve` | None | → `MANAGER_APPROVED` | ❌ | ❌ |
-| `PATCH /reject` | None | → `MANAGER_REJECTED` | ❌ | ❌ |
-| `PATCH /cancel` | → `CANCELLED` (if HCM confirms) | — | ✅ | Refund on HCM success |
-
-> **⚠️ Manager rejection ≠ cancellation.** A manager rejection sets `manager_status = MANAGER_REJECTED` only. It does **not** undo the HCM approval and does **not** restore the balance. To reverse an HCM-approved request, the correct action is `PATCH /time-off/:id/cancel`.
-
-> **UI display rule:** When `status = APPROVED` and `manager_status = MANAGER_REJECTED`, the API returns `effective_display_status: "APPROVED_HCM_REJECTED_MANAGER"`. UIs must render this explicitly — e.g. *"Approved in HCM, rejected by manager. To reverse the HCM approval, submit a cancellation."*
 
 ---
 
@@ -235,10 +191,8 @@ Step 5c ── HCM TIMEOUT / MAX RETRIES EXHAUSTED → leave status = PENDING,
 | Current Status | Action |
 |---|---|
 | `PENDING` | Cancel locally (no HCM call). Refund balance + set `CANCELLED` atomically. |
-| `APPROVED` | Call HCM first. **On success:** refund + set `CANCELLED` atomically. **On HCM failure/timeout:** leave as `APPROVED`, log to `SyncLog`, return HTTP 502. Do **not** auto-refund — the HCM has not acknowledged. |
+| `APPROVED` | Call HCM first. **On success:** refund + set `CANCELLED` atomically. **On HCM failure/timeout:** leave as `APPROVED`, return HTTP 502. Do **not** auto-refund — the HCM has not acknowledged. |
 | `REJECTED` / `CANCELLED` | Terminal — HTTP 422. |
-
-> **Batch lock check:** If a `BatchSyncLock` exists for this `employeeId`, the cancellation must pause and retry after the batch commits. Cancellations must **never** write to `LeaveBalance` while a batch lock is active.
 
 ---
 
@@ -262,17 +216,7 @@ Step 5c ── HCM TIMEOUT / MAX RETRIES EXHAUSTED → leave status = PENDING,
 
 ## 7. HCM Sync Strategy
 
-### 7.1 Real-Time Sync (TTL-Based)
-
-On every balance read, the service checks `lastSyncedAt` on the specific `LeaveBalance` record for that `(employeeId, locationId)` pair.
-
-- TTL staleness is evaluated **per record** — not globally
-- Default TTL: **5 minutes**, configurable via `BALANCE_TTL_SECONDS` env var
-- If `lastSyncedAt` is `null` **or** older than TTL → trigger background HCM sync asynchronously
-- The cached value is returned immediately (stale-while-revalidate)
-- Two employees at different locations have **independent TTL clocks**
-
-### 7.2 Batch Sync (`POST /balances/sync/batch`)
+### 7.1 Batch Sync (`POST /balances/sync/batch`)
 
 The HCM pushes a full corpus of balances. This endpoint processes the payload atomically. The following sequence **must** execute in this exact order within a **single DB transaction**:
 
@@ -289,19 +233,18 @@ The HCM pushes a full corpus of balances. This endpoint processes the payload at
 
 3. Upsert new HCM balance values into LeaveBalance.
    → HCM value always wins
-   → Set lastSyncedAt = NOW() for every upserted record, even if previously null
-   → Clear any stale_and_escalated flags for these records
+   → Set lastSyncedAt = NOW() for every upserted record
 
 4. Commit.
 ```
 
-> **Batch rollback rule:** If the transaction fails at any step, it rolls back atomically. Requests that were transitioned to `REJECTED` in step 2 revert to `PENDING`. No manual compensation logic is needed — the single transaction guarantees this automatically. The batch is logged to `SyncLog` as `FAILED`, and the caller receives `HTTP 422` with the offending record identified.
+> **Batch rollback rule:** If the transaction fails at any step, it rolls back atomically. Requests transitioned to `REJECTED` in step 2 revert to `PENDING`. No manual compensation logic is needed. The caller receives `HTTP 422` with the offending record identified.
 
-### 7.3 Conflict Resolution
+### 7.2 Conflict Resolution
 
-If a batch sync arrives and a balance is lower than the local cache (e.g. a request was filed directly in the HCM), **the HCM value always wins.** The reject-first, upsert-second order ensures no `PENDING` request is left referencing a balance that no longer exists.
+If a batch sync arrives and a balance is lower than the local cache, **the HCM value always wins.** The reject-first, upsert-second order ensures no `PENDING` request is left referencing a balance that no longer exists.
 
-### 7.4 Retry Logic
+### 7.3 Retry Logic
 
 All outbound HCM calls use exponential backoff:
 
@@ -315,33 +258,8 @@ All outbound HCM calls use exponential backoff:
 
 | Call Type | Behaviour |
 |---|---|
-| **Creation** | Auto-transition `PENDING` → `REJECTED`. Refund balance. Log to `SyncLog` with reason `"HCM unreachable after max retries"`. Return `HTTP 503` to caller. |
-| **Cancellation of APPROVED** | Leave as `APPROVED`. Log to `SyncLog`. Return `HTTP 502`. Require manual HR Admin intervention. **Do not auto-refund.** |
-| **Background balance sync** | Leave cached balance unchanged. Set `lastSyncedAt = null`. Log to `SyncLog`. Surface `stale_and_escalated: true` on next read. |
-
-### 7.5 Batch vs Real-Time Sync Concurrency
-
-- **Batch sync always wins.** It represents a full authoritative HCM snapshot.
-- Before a real-time sync job writes a balance update, it checks `BatchSyncLock` for the `employeeId`. If a lock is present → abort write, re-enqueue after **10 seconds**.
-- Cancellation flows are also subject to this rule — they must never write to `LeaveBalance` while a batch lock is active for that employee.
-- The batch sync sets `BatchSyncLock` at transaction start and removes it on commit **or rollback**.
-- Real-time sync jobs must **never** run in parallel for the same `(employeeId, locationId)` pair.
-
-### 7.6 SyncLog Semantics
-
-`SyncLog` is not a fire-and-forget audit trail — every entry is **actionable**.
-
-- **Retention:** Minimum 90 days. Entries older than 90 days may be archived but never deleted.
-- **Escalation:** If any `(employeeId, locationId)` pair accumulates **3 or more `FAILED` entries within a 1-hour window**, status upgrades to `ESCALATED`. The `GET /balances` response includes `stale_and_escalated: true` for affected records.
-- **Escalation workflow — 3 admin actions (HR_ADMIN role only):**
-
-| Action | Payload `action` value | Effect |
-|---|---|---|
-| **Retry** | `"RETRY"` | Fires a fresh HCM call. On success: marks `RESOLVED`, clears `stale_and_escalated`. |
-| **Override** | `"OVERRIDE"` | Admin manually sets balance. Marks `RESOLVED` with reason `"admin override"`. Records `adminUserId` + timestamp. |
-| **Discard** | `"DISCARD"` | Acknowledges failure, marks `RESOLVED` with reason `"admin discarded"`. No balance change. |
-
-> **No escalated entry may be auto-resolved by the system.** Human acknowledgement is always required.
+| **Creation** | Auto-transition `PENDING` → `REJECTED`. Refund balance. Return `HTTP 503` to caller. |
+| **Cancellation of APPROVED** | Leave as `APPROVED`. Return `HTTP 502`. Do not auto-refund. |
 
 ---
 
@@ -349,13 +267,13 @@ All outbound HCM calls use exponential backoff:
 
 | Challenge | Risk | Mitigation |
 |---|---|---|
-| **HCM balance changes independently** | Local cache becomes stale | TTL-based staleness per `(employeeId, locationId)` record; batch sync endpoint for full refresh |
+| **HCM balance changes independently** | Local cache becomes stale | Batch sync endpoint for full refresh; HCM value always overwrites local |
 | **HCM may not return errors reliably** | Invalid requests silently succeed | Defensive pre-validation against local balance before every HCM submission |
 | **Race conditions on deduction** | Two concurrent requests both pass validation but together exceed balance | Row-level `SELECT ... FOR UPDATE` lock acquired before validation; deduction and request creation committed atomically before HCM call |
-| **HCM temporarily unavailable** | Requests cannot be processed | Exponential backoff retry (3 attempts); auto-reject creation requests after exhaustion; cancellations blocked until HCM confirms |
+| **HCM temporarily unavailable** | Requests cannot be processed | Exponential backoff retry (3 attempts); auto-reject after exhaustion; cancellations blocked until HCM confirms |
 | **Batch sync mid-flight with active request** | Batch update overwrites a just-deducted balance | Batch applies row-level locks on PENDING requests; rejects conflicts before upserting new balances; single atomic transaction |
 | **Floating-point arithmetic drift** | Balance silently corrupts over many operations | `decimal.js` or integer half-day arithmetic mandatory for all balance mutations; native `number` operations forbidden |
-| **DB lock held during network call** | Deadlocks under concurrent load | DB transaction committed and `queryRunner` released before HCM HTTP call is initiated — enforced by code structure |
+| **DB lock held during network call** | Deadlocks under concurrent load | DB transaction committed and `queryRunner` released before HCM HTTP call is initiated |
 
 ---
 
@@ -365,13 +283,13 @@ All outbound HCM calls use exponential backoff:
 Every balance read calls HCM in real time with no local storage.
 - ✅ Always perfectly accurate
 - ❌ High latency; complete unavailability if HCM is down
-- **Decision: Rejected.** Local cache with TTL-based refresh gives acceptable accuracy with significantly better resilience.
+- **Decision: Rejected.** Local cache with batch sync gives acceptable accuracy with significantly better resilience.
 
 ### 9.2 Event-Driven Sync (Message Queue)
 Use a message broker (e.g. RabbitMQ, Kafka) to stream HCM balance change events.
 - ✅ Near real-time accuracy; decoupled architecture
 - ❌ Significant infrastructure complexity; message ordering and deduplication non-trivial
-- **Decision: Deferred.** Can be adopted in a future version if polling/batch proves insufficient at scale.
+- **Decision: Deferred.** Can be adopted in a future version if batch sync proves insufficient at scale.
 
 ### 9.3 PostgreSQL Instead of SQLite
 Use a production-grade relational database.
@@ -382,8 +300,8 @@ Use a production-grade relational database.
 ### 9.4 HCM Submission Timing — On Manager Approval
 Delay the HCM call until a manager approves rather than on employee submission.
 - ✅ Manager has veto power before balance is touched
-- ❌ Balance could change between submission and approval, causing drift; poorer UX (employee waits on manager before getting a decision)
-- **Decision: Rejected.** HCM called immediately on employee submission. Manager approval is ExampleHR-only metadata.
+- ❌ Balance could change between submission and approval, causing drift; poorer UX
+- **Decision: Rejected.** HCM called immediately on employee submission.
 
 ### 9.5 Seeding Method — SQL Scripts vs REST Controller
 Using SQL scripts vs a `SeedController` for test data.
@@ -400,7 +318,6 @@ Each service class and helper tested in isolation with **Jest**:
 - `BalanceMath` — deduct, refund, edge cases (0.5 increments, zero balance, max value)
 - `StateMachine.assertValidTransition` — all valid and all invalid transitions
 - Retry helper — correct delay sequence, throws after max attempts
-- `SyncLog` escalation threshold logic
 
 ### 10.2 Integration Tests (E2E)
 Full NestJS e2e tests against an in-memory SQLite database and a **live mock HCM server**:
@@ -410,14 +327,12 @@ Full NestJS e2e tests against an in-memory SQLite database and a **live mock HCM
 | Happy path: submit → HCM confirms | `APPROVED`, balance deducted |
 | Insufficient balance | `HTTP 422` before HCM is called |
 | HCM rejects | `REJECTED`, balance refunded atomically |
-| HCM times out (3 retries) | `REJECTED`, balance refunded, `SyncLog` entry created |
+| HCM times out (3 retries) | `REJECTED`, balance refunded, `HTTP 503` returned |
 | Cancel `APPROVED` request | HCM notified, balance refunded, `CANCELLED` |
 | Cancel `APPROVED` — HCM fails | Stays `APPROVED`, `HTTP 502` returned, balance untouched |
 | Concurrent requests against same balance | Only one succeeds; second gets `HTTP 422` |
 | Batch sync — conflict with `PENDING` | Conflict → `REJECTED`, new balance upserted |
 | Batch sync rollback | All changes reverted atomically; `PENDING` requests stay `PENDING` |
-| Manager rejects an `APPROVED` request | `manager_status = MANAGER_REJECTED`, HCM status unchanged, balance unchanged |
-| TTL expired — balance read | Background refresh triggered, stale value returned immediately |
 
 ### 10.3 Mock HCM Server
 A lightweight Express server deployed as part of the test suite:
@@ -449,9 +364,8 @@ A lightweight Express server deployed as part of the test suite:
 ## 12. Open Questions
 
 - Should partial-day requests be supported beyond `0.5` increments? *(Current: 0.5 minimum, universal)*
-- Is there an SLA for HCM availability? *(Affects retry timeout and `BALANCE_TTL_SECONDS` defaults)*
+- Is there an SLA for HCM availability? *(Affects retry timeout configuration)*
 - Should the service expose a WebSocket or SSE endpoint for real-time balance updates to the frontend?
-- Should `SyncLog` entries trigger external alerting (e.g. PagerDuty, Slack) on escalation, or is the `stale_and_escalated` API flag sufficient?
 
 ---
 
@@ -461,14 +375,11 @@ A lightweight Express server deployed as part of the test suite:
 |---|---|
 | **HCM** | Human Capital Management system (e.g. Workday, SAP). Source of truth for HR data. |
 | **Balance** | The number of leave days available to an employee at a given location. |
-| **TTL** | Time-to-live: duration after which a cached balance is considered stale. |
 | **Batch Sync** | A full dump of all balances from HCM sent to ExampleHR in a single payload. |
 | **Row-Level Lock** | A `SELECT ... FOR UPDATE` lock on a specific DB row, preventing concurrent writes to that row only. |
 | **hcmRef** | A reference ID returned by HCM when a time-off request is successfully filed. |
 | **assertValidTransition** | A shared guard function that enforces the status state machine. Throws HTTP 422 for any unlisted transition. |
-| **stale_and_escalated** | A response flag indicating a balance record has unresolved HCM sync failures and requires HR Admin intervention. |
-| **effective_display_status** | A derived API field returned when `status` and `manager_status` conflict, e.g. `"APPROVED_HCM_REJECTED_MANAGER"`. |
 
 ---
 
-*ExampleHR Time-Off Microservice — TRD v1.1*
+*ExampleHR Time-Off Microservice — TRD v1.0*
